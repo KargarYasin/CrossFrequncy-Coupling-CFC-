@@ -1,0 +1,158 @@
+"""
+Power per-window (Welch PSD) for all channels and subjects
+"""
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import mne
+from mne.time_frequency import psd_array_welch
+import warnings
+import json
+import time
+
+# Paths and core params
+ROOT = Path(r"D:\MeDo\main_Language\thesis\PAC\subs")
+OUT_DIR = Path(r"D:\MeDo\main_Language\thesis\PAC\Power_out")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+RESAMP = 256
+WINDOW_SEC = 2.0
+OVERLAP = 0.5
+WIN_SAMPS = int(WINDOW_SEC * RESAMP)
+STEP = int(WIN_SAMPS * (1 - OVERLAP))
+
+TRIALS = list(range(1, 41))
+SUBJECTS = None
+
+FREQ_BANDS = {
+    "delta": (1, 4),
+    "theta": (4, 8),
+    "alpha": (8, 12),
+    "beta":  (12, 30),
+    "gamma": (30, 60),
+}
+
+# Helpers
+def sliding_starts(n_samples, win, step):
+    if n_samples < win:
+        return np.array([], dtype=int)
+    return np.arange(0, n_samples - win + 1, step, dtype=int)
+
+def bandpower(psd, freqs, band):
+    fmin, fmax = band
+    mask = (freqs >= fmin) & (freqs < fmax)
+    return np.mean(psd[mask]) if mask.any() else np.nan
+
+# Processing
+all_rows = []
+all_rows_trial = []
+
+subject_dirs = sorted([d for d in ROOT.glob("S*") if d.is_dir()]) if SUBJECTS is None else [ROOT / s for s in SUBJECTS]
+print(f"Found {len(subject_dirs)} subjects.")
+
+for subj_dir in subject_dirs:
+    subject = subj_dir.name
+    subj_rows = []
+    subj_rows_trial = []
+
+    for trial_num in TRIALS:
+        fpath = subj_dir / f"{subject}_C{trial_num:02d}_raw.fif"
+        if not fpath.exists():
+            warnings.warn(f"{subject}: Trial {trial_num:02d} not found, skipping")
+            continue
+
+        print(f"Processing {subject}, trial {trial_num:02d} ...")
+        raw = mne.io.read_raw_fif(fpath, preload=True, verbose="ERROR")  # [web:27]
+        raw.pick("eeg")
+        if raw.info["sfreq"] != RESAMP:
+            raw.resample(RESAMP)  # [web:27]
+        data = raw.get_data()
+        ch_names = raw.ch_names
+        n_samples = data.shape[1]
+
+        starts = sliding_starts(n_samples, WIN_SAMPS, STEP)
+        if starts.size == 0:
+            warnings.warn(f"{subject}: trial {trial_num:02d} too short ({n_samples/RESAMP:.2f}s)")
+            continue
+
+        trial_power_accum = []
+
+        for ch_idx, chname in enumerate(ch_names):
+            for w_i, s in enumerate(starts):
+                seg = data[ch_idx, s:s+WIN_SAMPS].astype(np.float64)
+                seg = seg - seg.mean()
+
+                psd, freqs = psd_array_welch(
+                    seg[np.newaxis, :],
+                    sfreq=RESAMP,
+                    fmin=1,
+                    fmax=60,
+                    n_fft=WIN_SAMPS,
+                    n_overlap=0,
+                    verbose="ERROR",
+                )  # [web:37][web:39]
+                psd = psd.squeeze()
+
+                row = {
+                    "subject": subject,
+                    "trial": trial_num,
+                    "channel": chname,
+                    "window_idx": w_i,
+                    "start_s": s/RESAMP,
+                    "end_s": (s+WIN_SAMPS)/RESAMP,
+                }
+                for band, (fmin, fmax) in FREQ_BANDS.items():
+                    row[f"{band}_power"] = bandpower(psd, freqs, (fmin, fmax))
+                subj_rows.append(row)
+
+                trial_power_accum.append({**row})
+
+        if trial_power_accum:
+            df_trial = pd.DataFrame(trial_power_accum)
+            trial_means = df_trial[[f"{b}_power" for b in FREQ_BANDS]].mean()
+            trial_row = {"subject": subject, "trial": trial_num}
+            trial_row.update(trial_means.to_dict())
+            subj_rows_trial.append(trial_row)
+
+    df_subj = pd.DataFrame(subj_rows)
+    df_subj.to_csv(OUT_DIR / f"{subject}_ALLTRIALS_power_windows.csv", index=False)
+    print(f"  {subject}: saved {len(df_subj)} windows to CSV")
+
+    df_subj_trial = pd.DataFrame(subj_rows_trial)
+    df_subj_trial.to_csv(OUT_DIR / f"{subject}_ALLTRIALS_power_trials.csv", index=False)
+    print(f"  {subject}: saved {len(df_subj_trial)} trial-averages to CSV")
+
+    all_rows.extend(subj_rows)
+    all_rows_trial.extend(subj_rows_trial)
+
+# Save merged CSVs
+df_all = pd.DataFrame(all_rows)
+df_all.to_csv(OUT_DIR / f"ALL_subjects_ALLTRIALS_power_windows.csv", index=False)
+
+df_all_trial = pd.DataFrame(all_rows_trial)
+df_all_trial.to_csv(OUT_DIR / f"ALL_subjects_ALLTRIALS_power_trials.csv", index=False)
+
+print("="*60)
+print(f"All subjects done.")
+print(f"Total windows processed: {len(df_all)}")
+print(f"Total trials processed: {len(df_all_trial)}")
+print("Example per-window:")
+print(df_all.head())
+print("Example per-trial:")
+print(df_all_trial.head())
+
+# Save params
+params = {
+    "resample": RESAMP,
+    "window_sec": WINDOW_SEC,
+    "overlap": OVERLAP,
+    "trials": TRIALS,
+    "subjects": [d.name for d in subject_dirs],
+    "bands": FREQ_BANDS,
+    "date_run": time.ctime()
+}
+with open(OUT_DIR / "params_ALLTRIALS_power.json", "w") as fh:
+    json.dump(params, fh, indent=2)
+
+print("Params saved.")
