@@ -1,0 +1,176 @@
+"""
+PAC per-window (Tort MI) for all trials and subjects
+- PAC index: Modulation Index (Tort et al., 2010)
+"""
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import mne
+from tensorpac import Pac
+import warnings
+import json
+import time
+
+# Paths and params
+ROOT = Path(r"C:\Users\Kargar\Desktop\PAC\subs")
+OUT_DIR = Path(r"C:\Users\Kargar\Desktop\PAC\PAC_out_Tort")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+RESAMP = 256
+WINDOW_SEC = 2.0
+OVERLAP = 0.5
+WIN_SAMPS = int(WINDOW_SEC * RESAMP)
+STEP = int(WIN_SAMPS * (1 - OVERLAP))
+
+N_PERM = 2000
+TRIALS = list(range(1, 41))
+SUBJECTS = None
+CHANNELS = None
+
+# PAC definition (Tort MI via KL divergence)
+F_PHA = np.linspace(1., 8., 15)
+F_AMP = np.linspace(12., 60., 25)
+pac = Pac(idpac=(2, 0, 0), f_pha=F_PHA, f_amp=F_AMP, dcomplex="wavelet", n_bins=18)  # [web:19][web:53][web:20]
+F_PHA_VEC = pac.xvec
+F_AMP_VEC = pac.yvec
+
+TARGET_PAIRS = {
+    "theta_gamma": {"pha_range": (4., 8.), "amp_range": (30., 60.)},
+    "delta_beta": {"pha_range": (1., 4.), "amp_range": (12., 30.)},
+}
+
+# Helpers
+def sliding_starts(n_samples, win, step):
+    if n_samples < win:
+        return np.array([], dtype=int)
+    return np.arange(0, n_samples - win + 1, step, dtype=int)
+
+def fix_xpac_shape(xp, n_pha, n_amp):
+    xp = np.asarray(xp)
+    if xp.ndim == 3:
+        xp = np.squeeze(xp, axis=-1)
+    if xp.shape == (n_amp, n_pha):
+        xp = xp.T
+    elif xp.shape == (n_pha, n_amp):
+        pass
+    elif xp.size == n_pha * n_amp:
+        xp = xp.reshape(n_amp, n_pha).T
+    else:
+        return np.full((n_pha, n_amp), np.nan)
+    return xp
+
+def summarize_comod(comod, fpha, famp, target_pairs):
+    out = {}
+    out["global_max"] = float(np.nanmax(comod))
+    out["global_mean"] = float(np.nanmean(comod))
+    idx = np.unravel_index(np.nanargmax(comod), comod.shape)
+    out["peak_pha"] = float(fpha[idx[0]]) if idx[0] < len(fpha) else np.nan
+    out["peak_amp"] = float(famp[idx[1]]) if idx[1] < len(famp) else np.nan
+    for key, rng in target_pairs.items():
+        pha_inds = [i for i, f in enumerate(fpha) if rng["pha_range"][0] <= f <= rng["pha_range"][1]]
+        amp_inds = [j for j, f in enumerate(famp) if rng["amp_range"][0] <= f <= rng["amp_range"][1]]
+        out[f"{key}_mean"] = float(np.nanmean(comod[np.ix_(pha_inds, amp_inds)])) if (pha_inds and amp_inds) else np.nan
+    return out
+
+# Processing
+all_rows = []
+subject_dirs = sorted([d for d in ROOT.glob("S*") if d.is_dir()]) if SUBJECTS is None else [ROOT / s for s in SUBJECTS]
+print(f"Found {len(subject_dirs)} subjects.")
+
+for subj_dir in subject_dirs:
+    subject = subj_dir.name
+    subj_rows = []
+
+    for trial_num in TRIALS:
+        fpath = subj_dir / f"{subject}_C{trial_num:02d}_raw.fif"
+        if not fpath.exists():
+            warnings.warn(f"{subject}: Trial {trial_num:02d} not found, skipping")
+            continue
+
+        print(f"Processing {subject}, trial {trial_num:02d} ...")
+        raw = mne.io.read_raw_fif(fpath, preload=True, verbose="ERROR")  # [web:29]
+        raw.pick('eeg')
+        if raw.info["sfreq"] != RESAMP:
+            raw.resample(RESAMP)  # [web:27]
+        data = raw.get_data()
+        ch_names = raw.ch_names
+        n_samples = data.shape[1]
+
+        starts = sliding_starts(n_samples, WIN_SAMPS, STEP)
+        if starts.size == 0:
+            warnings.warn(f"{subject}: trial {trial_num:02d} too short ({n_samples/RESAMP:.2f}s)")
+            continue
+
+        for ch_idx, chname in enumerate(ch_names):
+            if CHANNELS is not None and chname not in CHANNELS:
+                continue
+
+            for w_i, s in enumerate(starts):
+                seg = data[ch_idx, s:s+WIN_SAMPS].astype(np.float64)
+                seg = seg - seg.mean()
+                seg = seg * np.hanning(len(seg))
+
+                try:
+                    xp = pac.filterfit(
+                        sf=RESAMP,
+                        x_pha=seg[np.newaxis, :],
+                        x_amp=seg[np.newaxis, :],
+                        n_perm=N_PERM,
+                    )  # [web:19]
+                    comod = fix_xpac_shape(xp, len(F_PHA_VEC), len(F_AMP_VEC))
+                except Exception as ex:
+                    warnings.warn(f"{subject} trial{trial_num:02d} {chname} win{w_i}: PAC failed ({ex})")
+                    comod = np.full((len(F_PHA_VEC), len(F_AMP_VEC)), np.nan)
+
+                summary = summarize_comod(comod, F_PHA_VEC, F_AMP_VEC, TARGET_PAIRS)
+                row = {
+                    "subject": subject,
+                    "trial": trial_num,
+                    "channel": chname,
+                    "window_idx": w_i,
+                    "start_s": s/RESAMP,
+                    "end_s": (s+WIN_SAMPS)/RESAMP,
+                    **summary
+                }
+                subj_rows.append(row)
+
+                np.save(OUT_DIR / f"{subject}_T{trial_num:02d}_{chname}_win{w_i:03d}_comod.npy", comod)
+
+    df_subj = pd.DataFrame(subj_rows)
+    df_subj.to_csv(OUT_DIR / f"{subject}_ALLTRIALS_pac_windows_TORT.csv", index=False)
+    print(f"  {subject}: saved {len(df_subj)} windows (channels={len(ch_names) if CHANNELS is None else len(CHANNELS)}) to CSV")
+    all_rows.extend(subj_rows)
+
+# Merge CSV
+df_all = pd.DataFrame(all_rows)
+csv_path = OUT_DIR / f"ALL_subjects_ALLTRIALS_pac_windows_TORT.csv"
+df_all.to_csv(csv_path, index=False)
+
+print("="*60)
+print(f"All subjects done. Merged CSV: {csv_path}")
+print(f"Total windows processed: {len(df_all)}")
+print("Example rows:")
+print(df_all.head())
+
+# Save params
+params = {
+    "resample": RESAMP,
+    "window_sec": WINDOW_SEC,
+    "overlap": OVERLAP,
+    "n_perm": N_PERM,
+    "idpac": (2, 0, 0),
+    "trials": TRIALS,
+    "subjects": [d.name for d in subject_dirs],
+    "channels": "ALL" if CHANNELS is None else CHANNELS,
+    "n_channels": len(ch_names) if CHANNELS is None else len(CHANNELS),
+    "f_pha_input": F_PHA.tolist(),
+    "f_amp_input": F_AMP.tolist(),
+    "f_pha_vec": F_PHA_VEC.tolist(),
+    "f_amp_vec": F_AMP_VEC.tolist(),
+    "date_run": time.ctime()
+}
+with open(OUT_DIR / "params_ALLTRIALS_TORT.json", "w") as fh:
+    json.dump(params, fh, indent=2)
+
+print("Params saved.")
